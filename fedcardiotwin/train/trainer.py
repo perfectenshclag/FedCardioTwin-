@@ -53,7 +53,7 @@ def _mixup(x, y, alpha):
 
 def train_model(model, loader, device, epochs, lr=1e-3, weight_decay=1e-4,
                 prox_mu=0.0, global_params=None, max_steps=None, log_fn=None,
-                mixup_alpha=0.0, ema_decay=0.0):
+                mixup_alpha=0.0, ema_decay=0.0, ckpt_path=None, ckpt_every=1):
     """One local/centralized training run. prox_mu>0 adds the FedProx term;
     mixup_alpha>0 enables mixup; ema_decay>0 evaluates the EMA weights."""
     model.to(device).train()
@@ -92,6 +92,15 @@ def train_model(model, loader, device, epochs, lr=1e-3, weight_decay=1e-4,
             step += 1
         if log_fn:
             log_fn(f"  epoch {ep + 1}/{epochs} loss={loss.item():.4f}")
+        if ckpt_path and ((ep + 1) % ckpt_every == 0 or ep + 1 == epochs):
+            save_model = model
+            if ema is not None:  # checkpoint EMA weights without disturbing training
+                tmp = {k: v.clone() for k, v in model.state_dict().items()}
+                ema.copy_to(model)
+                torch.save({"epoch": ep + 1, "model": model.state_dict()}, ckpt_path)
+                model.load_state_dict(tmp)
+            else:
+                torch.save({"epoch": ep + 1, "model": save_model.state_dict()}, ckpt_path)
     if ema is not None:
         ema.copy_to(model)
     return model

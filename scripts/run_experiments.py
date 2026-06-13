@@ -59,6 +59,10 @@ def main():
         from torch.utils.data import ConcatDataset, DataLoader
         from fedcardiotwin.data.dataset import ECGDataset
         for seed in cfg.seeds:
+            result_path = f"{args.results_dir}/centralized_seed{seed}.json"
+            if os.path.exists(result_path):
+                log.info(f"[centralized] seed{seed} already done, skipping")
+                continue
             seed_everything(seed)
             tr = ConcatDataset([ECGDataset(c.X, c.Y, c.train_idx, True,
                                            augment=cfg.central.augment)
@@ -66,9 +70,15 @@ def main():
             loader = DataLoader(tr, batch_size=cfg.central.batch_size, shuffle=True,
                                 num_workers=2, pin_memory=True, drop_last=True)
             model = build_model(cfg.model, space.num_classes)
+            progress_path = f"{args.ckpt_dir}/central_seed{seed}_progress.pt"
+            if os.path.exists(progress_path):
+                ck = torch.load(progress_path, map_location="cpu")
+                model.load_state_dict(ck["model"])
+                log.info(f"[centralized] seed{seed} resumed from epoch {ck['epoch']}")
             train_model(model, loader, device, cfg.central.epochs, lr=cfg.central.lr,
                         mixup_alpha=cfg.central.mixup_alpha,
-                        ema_decay=cfg.central.ema_decay, log_fn=log.info)
+                        ema_decay=cfg.central.ema_decay, log_fn=log.info,
+                        ckpt_path=progress_path, ckpt_every=5)
             res = {}
             for c in clients:
                 m, _ = evaluate(model, c.loader("val", cfg.central.batch_size),
@@ -76,14 +86,22 @@ def main():
                 res[c.name] = m
             save_json(res, f"{args.results_dir}/centralized_seed{seed}.json")
             torch.save(model.state_dict(), f"{args.ckpt_dir}/central_seed{seed}.pt")
+            if os.path.exists(progress_path):
+                os.remove(progress_path)
 
     elif args.stage == "federated":
         for strategy in args.strategies:
             for seed in cfg.seeds:
+                result_path = f"{args.results_dir}/fed_{strategy}_seed{seed}.json"
+                if os.path.exists(result_path):
+                    log.info(f"[federated] {strategy} seed{seed} already done, skipping")
+                    continue
                 seed_everything(seed)
+                progress_path = f"{args.ckpt_dir}/fed_{strategy}_seed{seed}_progress.pt"
                 res, history, comm_mb, gmodel, deployed = run_federated(
                     clients, space.num_classes, cfg.fl, device,
-                    model_name=cfg.model, strategy=strategy, seed=seed)
+                    model_name=cfg.model, strategy=strategy, seed=seed,
+                    ckpt_path=progress_path)
                 res["comm_mb_per_round"] = comm_mb
                 res["history"] = history  # convergence / comm-budget curves
                 save_json(res, f"{args.results_dir}/fed_{strategy}_seed{seed}.json")
@@ -92,12 +110,18 @@ def main():
                 # deployed per-client models: what conformal must evaluate
                 torch.save(deployed,
                            f"{args.ckpt_dir}/fed_{strategy}_seed{seed}_clients.pt")
+                if os.path.exists(progress_path):
+                    os.remove(progress_path)
 
     elif args.stage == "twin":
         streams_db = PTBXLStreams(args.cache_dir)
         from torch.utils.data import DataLoader
         from fedcardiotwin.data.dataset import ECGDataset
         for seed in cfg.seeds:
+            result_path = f"{args.results_dir}/twin_seed{seed}.json"
+            if os.path.exists(result_path):
+                log.info(f"[twin] seed{seed} already done, skipping")
+                continue
             seed_everything(seed)
             base_idx = streams_db.base_indices()
             loader = DataLoader(
@@ -106,15 +130,23 @@ def main():
                 batch_size=cfg.central.batch_size, shuffle=True,
                 num_workers=2, pin_memory=True, drop_last=True)
             base = build_model(cfg.model, streams_db.Y.shape[1])
+            progress_path = f"{args.ckpt_dir}/twin_seed{seed}_progress.pt"
+            if os.path.exists(progress_path):
+                ck = torch.load(progress_path, map_location="cpu")
+                base.load_state_dict(ck["model"])
+                log.info(f"[twin] seed{seed} resumed from epoch {ck['epoch']}")
             train_model(base, loader, device, cfg.central.epochs,
                         lr=cfg.central.lr, mixup_alpha=cfg.central.mixup_alpha,
-                        ema_decay=cfg.central.ema_decay, log_fn=log.info)
+                        ema_decay=cfg.central.ema_decay, log_fn=log.info,
+                        ckpt_path=progress_path, ckpt_every=5)
             streams = streams_db.eval_streams()
             res, arrays = run_twin_evaluation(base, streams, streams_db.X,
                                               streams_db.Y, device, cfg.twin)
             save_json(res, f"{args.results_dir}/twin_seed{seed}.json")
             np.savez(f"{args.results_dir}/twin_seed{seed}_arrays.npz", **arrays)
             log.info(f"twin seed{seed}: {res}")
+            if os.path.exists(progress_path):
+                os.remove(progress_path)
 
     elif args.stage == "conformal":
         # Evaluates the *deployed* per-client models (global shared weights

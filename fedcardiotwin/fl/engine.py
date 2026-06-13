@@ -12,6 +12,7 @@ shared weights composed with each client's private tensors) so downstream
 stages (conformal) evaluate exactly what a hospital would run.
 """
 import copy
+import os
 
 import torch
 
@@ -50,9 +51,14 @@ def _avg_states(states, weights, keys):
 
 
 def run_federated(clients, num_classes, cfg, device, model_name="inception1d",
-                  strategy="fedavg", seed=0):
+                  strategy="fedavg", seed=0, ckpt_path=None, resume=True):
     """Returns (per-client metrics, history, comm_mb_per_round, global_model,
-    deployed_states: {client_name: state_dict})."""
+    deployed_states: {client_name: state_dict}).
+
+    If ckpt_path is given, progress (global model, local/personal states,
+    momentum, history, completed round) is saved after every round and
+    reloaded on resume — so an interrupted run continues instead of
+    restarting from round 0."""
     torch.manual_seed(seed)
     global_model = build_model(model_name, num_classes)
     all_keys = set(global_model.state_dict().keys())
@@ -80,6 +86,17 @@ def run_federated(clients, num_classes, cfg, device, model_name="inception1d",
     rounds = 1 if strategy == "local" else cfg.rounds
     local_epochs = cfg.local_only_epochs if strategy == "local" else cfg.local_epochs
 
+    start_round = 0
+    if ckpt_path and resume and os.path.exists(ckpt_path):
+        ck = torch.load(ckpt_path, map_location="cpu")
+        global_model.load_state_dict(ck["global_state"])
+        local_states = ck["local_states"]
+        personal = ck["personal"]
+        momentum = ck["momentum"]
+        history = ck["history"]
+        start_round = ck["round"]
+        log.info(f"[{strategy}] resumed from round {start_round}/{rounds}")
+
     def deployed_state(ci):
         """What client ci actually runs in production for this strategy."""
         if strategy == "local":
@@ -92,7 +109,7 @@ def run_federated(clients, num_classes, cfg, device, model_name="inception1d",
                 st[k] = local_states[ci][k].clone()
         return st
 
-    for rnd in range(rounds):
+    for rnd in range(start_round, rounds):
         # round-start global parameters: prox target for fedprox AND ditto
         g0 = [p.detach().clone() for p in global_model.parameters()]
         states = []
@@ -147,6 +164,16 @@ def run_federated(clients, num_classes, cfg, device, model_name="inception1d",
                 entry[client.name] = macro_auroc(yv, pv)
             history.append(entry)
         log.info(f"[{strategy}] round {rnd + 1}/{rounds} done")
+
+        if ckpt_path:
+            torch.save({
+                "round": rnd + 1,
+                "global_state": global_model.state_dict(),
+                "local_states": local_states,
+                "personal": personal,
+                "momentum": momentum,
+                "history": history,
+            }, ckpt_path)
 
     # Final evaluation: each client evaluates its deployed model.
     results, deployed = {}, {}
