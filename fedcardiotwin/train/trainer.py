@@ -1,0 +1,126 @@
+"""Training/eval loops shared by centralized, federated, and twin code paths.
+
+Best-results recipe: AdamW + OneCycle, mixed precision on CUDA, random-crop
+training, sliding-window (stride 125) probability averaging at eval.
+"""
+import numpy as np
+import torch
+import torch.nn as nn
+
+from ..data.dataset import CROP_LEN
+from .metrics import macro_auroc, macro_f1, tune_thresholds
+
+EVAL_STRIDE = 125
+
+
+def _amp_ctx(device):
+    if device.type == "cuda":
+        return torch.autocast("cuda", dtype=torch.float16)
+    import contextlib
+    return contextlib.nullcontext()
+
+
+class ModelEma:
+    """Exponential moving average of weights; evaluated weights are the EMA.
+    A consistently free accuracy gain on long centralized runs."""
+
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {k: v.detach().clone().float()
+                       for k, v in model.state_dict().items()}
+
+    @torch.no_grad()
+    def update(self, model):
+        for k, v in model.state_dict().items():
+            s = self.shadow[k]
+            if v.dtype.is_floating_point:
+                s.mul_(self.decay).add_(v.detach().float(), alpha=1 - self.decay)
+            else:
+                s.copy_(v)
+
+    def copy_to(self, model):
+        st = model.state_dict()
+        for k in st:
+            st[k] = self.shadow[k].to(st[k].dtype)
+        model.load_state_dict(st)
+
+
+def _mixup(x, y, alpha):
+    lam = float(np.random.beta(alpha, alpha))
+    perm = torch.randperm(x.size(0), device=x.device)
+    return lam * x + (1 - lam) * x[perm], lam * y + (1 - lam) * y[perm]
+
+
+def train_model(model, loader, device, epochs, lr=1e-3, weight_decay=1e-4,
+                prox_mu=0.0, global_params=None, max_steps=None, log_fn=None,
+                mixup_alpha=0.0, ema_decay=0.0):
+    """One local/centralized training run. prox_mu>0 adds the FedProx term;
+    mixup_alpha>0 enables mixup; ema_decay>0 evaluates the EMA weights."""
+    model.to(device).train()
+    params = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    steps = max_steps or (epochs * max(1, len(loader)))
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, total_steps=steps)
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    crit = nn.BCEWithLogitsLoss()
+    ema = ModelEma(model, ema_decay) if ema_decay > 0 else None
+
+    if global_params is not None:
+        global_params = [g.to(device) for g in global_params]
+
+    step = 0
+    for ep in range(epochs):
+        for x, y in loader:
+            if step >= steps:
+                break
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            if mixup_alpha > 0 and x.size(0) > 1:
+                x, y = _mixup(x, y, mixup_alpha)
+            opt.zero_grad(set_to_none=True)
+            with _amp_ctx(device):
+                loss = crit(model(x), y)
+            if prox_mu > 0 and global_params is not None:
+                prox = sum(((p - g) ** 2).sum()
+                           for p, g in zip(params, global_params))
+                loss = loss + 0.5 * prox_mu * prox
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+            sched.step()
+            if ema is not None:
+                ema.update(model)
+            step += 1
+        if log_fn:
+            log_fn(f"  epoch {ep + 1}/{epochs} loss={loss.item():.4f}")
+    if ema is not None:
+        ema.copy_to(model)
+    return model
+
+
+@torch.no_grad()
+def predict(model, loader, device, crop_len=CROP_LEN, stride=EVAL_STRIDE):
+    """Sliding-window prediction over full 10 s records, mean-aggregated."""
+    model.to(device).eval()
+    probs, ys = [], []
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        if x.shape[-1] > crop_len:
+            windows = x.unfold(-1, crop_len, stride)        # (B,12,W,crop)
+            B, C, W, L = windows.shape
+            flat = windows.permute(0, 2, 1, 3).reshape(B * W, C, L)
+            with _amp_ctx(device):
+                out = torch.sigmoid(model(flat).float()).reshape(B, W, -1).mean(1)
+        else:
+            with _amp_ctx(device):
+                out = torch.sigmoid(model(x).float())
+        probs.append(out.cpu().numpy())
+        ys.append(y.numpy())
+    return np.concatenate(probs), np.concatenate(ys)
+
+
+def evaluate(model, val_loader, test_loader, device):
+    """Tune thresholds on val, report AUROC/F1 on test."""
+    pv, yv = predict(model, val_loader, device)
+    th = tune_thresholds(yv, pv)
+    pt, yt = predict(model, test_loader, device)
+    return {"auroc": macro_auroc(yt, pt), "f1": macro_f1(yt, pt, th)}, (pt, yt, th)
