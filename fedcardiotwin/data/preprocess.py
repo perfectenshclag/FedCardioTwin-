@@ -6,6 +6,7 @@ touches WFDB again (critical for throughput on Kaggle/Colab disks).
 """
 import ast
 import glob
+import multiprocessing as mp
 import os
 from fractions import Fraction
 
@@ -79,11 +80,26 @@ def _read_header_meta(hea_path):
     return fs, dx
 
 
+def _process_cinc_record(args):
+    hea, label_space = args
+    import wfdb
+    rec = hea[:-4]
+    try:
+        fs, dx = _read_header_meta(hea)
+        y = label_space.encode(dx)
+        if y is None:
+            return None
+        sig, _ = wfdb.rdsamp(rec)
+        x = standardize_signal(sig, fs).astype(np.float16)
+        return x, y, os.path.basename(rec)
+    except Exception as e:  # corrupt records exist in the wild
+        log.info(f"[cache] skip {rec}: {e}")
+        return None
+
+
 def build_cinc_cache(raw_dir, cache_dir, evaluation_repo_dir,
                      sources=None, max_per_source=None, seed=0):
     """Cache every CinC-2021 source as X.npy (N,12,1000 float16) + Y.npy + manifest."""
-    import wfdb
-
     label_space = ScoredLabelSpace(evaluation_repo_dir)
     sources = sources or DEFAULT_SOURCES
     rng = np.random.RandomState(seed)
@@ -103,19 +119,17 @@ def build_cinc_cache(raw_dir, cache_dir, evaluation_repo_dir,
             heas = [heas[i] for i in rng.permutation(len(heas))[:max_per_source]]
 
         xs, ys, names = [], [], []
-        for hea in heas:
-            rec = hea[:-4]
-            try:
-                fs, dx = _read_header_meta(hea)
-                y = label_space.encode(dx)
-                if y is None:
+        ctx = mp.get_context("fork")
+        with ctx.Pool(processes=max(1, (os.cpu_count() or 2) - 1)) as pool:
+            for result in pool.imap(_process_cinc_record,
+                                     ((hea, label_space) for hea in heas),
+                                     chunksize=16):
+                if result is None:
                     continue
-                sig, _ = wfdb.rdsamp(rec)
-                xs.append(standardize_signal(sig, fs).astype(np.float16))
+                x, y, name = result
+                xs.append(x)
                 ys.append(y)
-                names.append(os.path.basename(rec))
-            except Exception as e:  # corrupt records exist in the wild
-                log.info(f"[cache] skip {rec}: {e}")
+                names.append(name)
         if not xs:
             continue
         os.makedirs(out_dir, exist_ok=True)
@@ -127,11 +141,22 @@ def build_cinc_cache(raw_dir, cache_dir, evaluation_repo_dir,
     return label_space
 
 
+def _process_ptbxl_record(args):
+    ptbxl_dir, fname, space, scp_codes, ecg_id, patient_id, date, strat_fold = args
+    import wfdb
+    y = space.encode(scp_codes)
+    if y is None:
+        return None
+    sig, meta = wfdb.rdsamp(os.path.join(ptbxl_dir, fname))
+    x = standardize_signal(sig, meta["fs"]).astype(np.float16)
+    row = {"ecg_id": ecg_id, "patient_id": patient_id, "date": date,
+           "strat_fold": strat_fold, "y": y}
+    return x, row
+
+
 def build_ptbxl_cache(ptbxl_dir, cache_dir, sampling_rate=100):
     """Track-B cache: original PTB-XL with patient_id + recording date so the
     twin module can replay multi-record patients chronologically."""
-    import wfdb
-
     space = PTBXLSuperclassSpace(ptbxl_dir)
     db = pd.read_csv(os.path.join(ptbxl_dir, "ptbxl_database.csv"), index_col="ecg_id")
     db.scp_codes = db.scp_codes.apply(ast.literal_eval)
@@ -141,16 +166,20 @@ def build_ptbxl_cache(ptbxl_dir, cache_dir, sampling_rate=100):
     if os.path.exists(os.path.join(out_dir, "X.npy")):
         log.info("[cache] PTBXL_TRACKB: already built, skipping")
         return space
+    tasks = (
+        (ptbxl_dir, row[fname_col], space, row.scp_codes, ecg_id,
+         int(row.patient_id), str(row.recording_date), int(row.strat_fold))
+        for ecg_id, row in db.iterrows()
+    )
     xs, rows = [], []
-    for ecg_id, row in db.iterrows():
-        y = space.encode(row.scp_codes)
-        if y is None:
-            continue
-        sig, meta = wfdb.rdsamp(os.path.join(ptbxl_dir, row[fname_col]))
-        xs.append(standardize_signal(sig, meta["fs"]).astype(np.float16))
-        rows.append({"ecg_id": ecg_id, "patient_id": int(row.patient_id),
-                     "date": str(row.recording_date), "strat_fold": int(row.strat_fold),
-                     "y": y})
+    ctx = mp.get_context("fork")
+    with ctx.Pool(processes=max(1, (os.cpu_count() or 2) - 1)) as pool:
+        for result in pool.imap(_process_ptbxl_record, tasks, chunksize=16):
+            if result is None:
+                continue
+            x, row = result
+            xs.append(x)
+            rows.append(row)
     os.makedirs(out_dir, exist_ok=True)
     np.save(os.path.join(out_dir, "X.npy"), np.stack(xs))
     np.save(os.path.join(out_dir, "Y.npy"),
