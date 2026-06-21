@@ -15,6 +15,7 @@ class FLConfig:
     prox_mu: float = 0.01            # fedprox
     ditto_lambda: float = 0.1        # ditto prox strength
     server_momentum: float = 0.9     # fedavgm
+    server_lr: float = 0.1           # fedavgm server step damping (~1-momentum)
     eval_every: int = 10             # rounds between val-AUROC history points
                                      # (0 disables; last round always logged)
 

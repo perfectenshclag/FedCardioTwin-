@@ -148,7 +148,12 @@ def run_federated(clients, num_classes, cfg, device, model_name="inception1d",
                         continue
                     delta = gst[k].float() - avg[k].float()
                     momentum[k] = cfg.server_momentum * momentum[k] + delta
-                    gst[k] = (gst[k].float() - momentum[k]).to(gst[k].dtype)
+                    # Server learning rate damps the momentum step. Without it
+                    # the steady-state update is delta/(1-momentum) ~= 10x a
+                    # FedAvg step, which diverges to NaN. server_lr=(1-momentum)
+                    # makes the steady-state step equal a vanilla FedAvg step.
+                    gst[k] = (gst[k].float()
+                              - cfg.server_lr * momentum[k]).to(gst[k].dtype)
             else:
                 for k in avg:
                     gst[k] = avg[k]
