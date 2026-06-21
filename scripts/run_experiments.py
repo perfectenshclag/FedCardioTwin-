@@ -45,9 +45,14 @@ def main():
     ap.add_argument("--eval-repo", default="external/evaluation-2021")
     ap.add_argument("--results-dir", default="results")
     ap.add_argument("--ckpt-dir", default="checkpoints")
+    ap.add_argument("--seeds", nargs="+", type=int, default=None,
+                    help="override the preset's seeds (e.g. --seeds 0 to "
+                         "regenerate only seed 0)")
     args = ap.parse_args()
 
     cfg = fast_preset() if args.preset == "fast" else full_preset()
+    if args.seeds is not None:
+        cfg.seeds = tuple(args.seeds)
     device = get_device()
     log.info(f"device: {device}")
     os.makedirs(args.ckpt_dir, exist_ok=True)
