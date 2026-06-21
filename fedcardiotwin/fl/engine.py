@@ -62,6 +62,7 @@ def run_federated(clients, num_classes, cfg, device, model_name="inception1d",
     torch.manual_seed(seed)
     global_model = build_model(model_name, num_classes)
     all_keys = set(global_model.state_dict().keys())
+    param_keys = {n for n, _ in global_model.named_parameters()}  # learnable only
     bn = _bn_keys(global_model)
     head = _head_keys(global_model)
 
@@ -143,15 +144,19 @@ def run_federated(clients, num_classes, cfg, device, model_name="inception1d",
                 if momentum is None:
                     momentum = {k: torch.zeros_like(v.float()) for k, v in avg.items()}
                 for k in avg:
-                    if not gst[k].dtype.is_floating_point:  # e.g. BN step counts
+                    # Only momentum-update learnable params. Applying momentum
+                    # to BN buffers (running_var) can drive variance negative
+                    # -> sqrt(<0) at eval -> NaN; average those directly like
+                    # FedAvg does. (num_batches_tracked is non-float, also here.)
+                    if k not in param_keys:
                         gst[k] = avg[k]
                         continue
                     delta = gst[k].float() - avg[k].float()
                     momentum[k] = cfg.server_momentum * momentum[k] + delta
                     # Server learning rate damps the momentum step. Without it
                     # the steady-state update is delta/(1-momentum) ~= 10x a
-                    # FedAvg step, which diverges to NaN. server_lr=(1-momentum)
-                    # makes the steady-state step equal a vanilla FedAvg step.
+                    # FedAvg step, which diverges. server_lr=(1-momentum) makes
+                    # the steady-state step equal a vanilla FedAvg step.
                     gst[k] = (gst[k].float()
                               - cfg.server_lr * momentum[k]).to(gst[k].dtype)
             else:
