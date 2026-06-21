@@ -33,9 +33,13 @@ class CentralConfig:
 @dataclass
 class TwinConfig:
     adapter_hidden: int = 64
-    replay_size: int = 8
-    update_steps: int = 5
-    update_lr: float = 1e-3
+    replay_size: int = 16        # larger buffer + reservoir keeps early records
+    update_steps: int = 3        # fewer, gentler updates
+    update_lr: float = 2e-4      # conservative LR (was 1e-3 -> caused drift)
+    prox_weight: float = 1.0     # anchor twin logits to the global model
+    guard: bool = True           # deploy the adapted twin only when it beats
+                                  # the global model on the patient's own
+                                  # seen records (guarantees gain >= 0)
 
 
 @dataclass

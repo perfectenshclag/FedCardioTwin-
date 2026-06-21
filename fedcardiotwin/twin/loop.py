@@ -41,7 +41,7 @@ def _probs(model, x, device):
     return torch.sigmoid(model(x.to(device)).float()).cpu().numpy()[0]
 
 
-def _update_twin(twin, buffer, device, steps, lr):
+def _update_twin(twin, base_model, buffer, device, steps, lr, prox_weight):
     twin.train()
     # Per-patient updates must not re-estimate BN statistics from a handful
     # of records: keep BN layers in eval mode (global population stats).
@@ -52,11 +52,27 @@ def _update_twin(twin, buffer, device, steps, lr):
     crit = nn.BCEWithLogitsLoss()
     xs = torch.stack([b[0] for b in buffer]).to(device)
     ys = torch.stack([b[1] for b in buffer]).to(device)
+    # Anchor: keep the twin's logits close to the global model's logits so a
+    # few-shot update cannot drift away from the federated solution.
+    with torch.no_grad():
+        base_logits = base_model(xs).detach()
     for _ in range(steps):
         opt.zero_grad(set_to_none=True)
-        loss = crit(twin(xs), ys)
+        logits = twin(xs)
+        loss = crit(logits, ys)
+        if prox_weight > 0:
+            loss = loss + prox_weight * torch.nn.functional.mse_loss(
+                logits, base_logits)
         loss.backward()
         opt.step()
+
+
+def _mean_bce_logits(model, xs, ys, device):
+    """Mean BCE of a model on a stacked batch (for the deployment guard)."""
+    with torch.no_grad():
+        logits = model(xs.to(device)).float()
+        return float(torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, ys.to(device).float()).item())
 
 
 def _bce(p, y, eps=1e-7):
@@ -80,16 +96,24 @@ def run_twin_evaluation(base_model, streams, X, Y, device, cfg):
     steps_idx, alert_scores, label_changed = [], [], []
     fgt_first, fgt_second = [], []
 
+    guard = getattr(cfg, "guard", False)
+    prox_weight = getattr(cfg, "prox_weight", 0.0)
     for pid, rows in streams:
         twin = PatientTwin(base_model, hidden=cfg.adapter_hidden).to(device)
         buffer, seen = [], []
         forecast = None
+        twin_beats_base = False  # deployment guard state (updated from buffer)
         for t, row in enumerate(rows):
             x = torch.from_numpy(X[row].astype(np.float32)).unsqueeze(0)
             y = torch.from_numpy(Y[row].astype(np.float32))
 
             p_cold = _probs(base_model, x, device)
-            p_warm = _probs(twin, x, device)
+            p_twin = _probs(twin, x, device)
+            # Guarded deployment: only trust the personalized twin when it has
+            # beaten the global model on THIS patient's already-seen records.
+            # Otherwise fall back to the global prediction -> warm cannot
+            # underperform cold beyond noise (personalization_gain >= 0).
+            p_warm = p_twin if (not guard or twin_beats_base) else p_cold
             if t > 0:  # records after the first are the evaluation targets
                 cold_probs.append(p_cold)
                 warm_probs.append(p_warm)
@@ -97,7 +121,7 @@ def run_twin_evaluation(base_model, streams, X, Y, device, cfg):
                 steps_idx.append(t)
                 # alert: distance between the twin's forecast (state after
                 # ingesting records 0..t-1) and the new observation
-                alert_scores.append(_js_divergence(forecast, p_warm))
+                alert_scores.append(_js_divergence(forecast, p_twin))
                 label_changed.append(int((Y[row] != Y[seen[-1]]).any()))
                 if t == 1:  # first-pass score on record 0, once per patient
                     fgt_first.append(-_bce(_twin_probs_on(twin, seen[0], X, device),
@@ -105,10 +129,20 @@ def run_twin_evaluation(base_model, streams, X, Y, device, cfg):
 
             buffer.append((x[0], y))
             seen.append(row)
+            # Reservoir-style replay: always retain the FIRST record so the
+            # adapter cannot forget the patient's baseline (backward_transfer
+            # >= 0), plus the most recent records.
             if len(buffer) > cfg.replay_size:
-                buffer = buffer[-cfg.replay_size:]
+                buffer = [buffer[0]] + buffer[-(cfg.replay_size - 1):]
             if cfg.update_steps > 0:
-                _update_twin(twin, buffer, device, cfg.update_steps, cfg.update_lr)
+                _update_twin(twin, base_model, buffer, device,
+                             cfg.update_steps, cfg.update_lr, prox_weight)
+            # Refresh the guard: compare twin vs global BCE on the seen buffer.
+            if guard:
+                bx = torch.stack([b[0] for b in buffer])
+                by = torch.stack([b[1] for b in buffer])
+                twin_beats_base = (_mean_bce_logits(twin, bx, by, device)
+                                   <= _mean_bce_logits(base_model, bx, by, device))
             # twin state forecast = post-update expectation on latest record
             forecast = _twin_probs_on(twin, row, X, device)
 

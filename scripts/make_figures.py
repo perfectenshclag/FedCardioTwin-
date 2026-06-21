@@ -169,23 +169,33 @@ def fig_conformal(results_dir, out_dir):
     x = np.arange(len(names))
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
 
-    loc_fnr = [cl[c]["local"]["fnr"] for c in names]
-    fed_fnr = [cl[c]["federated"]["fnr"] for c in names]
-    ax1.bar(x - 0.2, loc_fnr, 0.4, label="Local", color="#4C72B0")
-    ax1.bar(x + 0.2, fed_fnr, 0.4, label="Federated", color="#55A868")
+    has_pers = all("personalized" in cl[c] for c in names)
+    modes = [("federated", "Federated", "#55A868")]
+    if has_pers:
+        modes.append(("personalized", "Personalized (λ_h)", "#8172B3"))
+    nb = len(modes) + 1  # +1 for local
+    w = 0.8 / nb
+    off = (np.arange(nb) - (nb - 1) / 2) * w
+
+    ax1.bar(x + off[0], [cl[c]["local"]["fnr"] for c in names], w,
+            label="Local", color="#4C72B0")
+    for i, (key, lab, col) in enumerate(modes):
+        ax1.bar(x + off[i + 1], [cl[c][key]["fnr"] for c in names], w,
+                label=lab, color=col)
     ax1.axhline(alpha, ls="--", color="k", lw=1, label=f"target α={alpha}")
     ax1.set_xticks(x); ax1.set_xticklabels(names, rotation=15)
     ax1.set_ylabel("False-negative rate"); ax1.set_title("FNR coverage")
     ax1.legend(fontsize=8)
 
-    loc_ss = [cl[c]["local"]["mean_set_size"] for c in names]
-    fed_ss = [cl[c]["federated"]["mean_set_size"] for c in names]
-    ax2.bar(x - 0.2, loc_ss, 0.4, label="Local", color="#4C72B0")
-    ax2.bar(x + 0.2, fed_ss, 0.4, label="Federated", color="#55A868")
+    ax2.bar(x + off[0], [cl[c]["local"]["mean_set_size"] for c in names], w,
+            label="Local", color="#4C72B0")
+    for i, (key, lab, col) in enumerate(modes):
+        ax2.bar(x + off[i + 1], [cl[c][key]["mean_set_size"] for c in names], w,
+                label=lab, color=col)
     ax2.set_xticks(x); ax2.set_xticklabels(names, rotation=15)
     ax2.set_ylabel("Mean prediction-set size"); ax2.set_title("Set size")
     ax2.legend(fontsize=8)
-    fig.suptitle("Federated conformal risk control: local vs federated λ")
+    fig.suptitle("Federated conformal risk control: per-hospital coverage")
     _save(fig, out_dir, "fig_conformal")
 
 
