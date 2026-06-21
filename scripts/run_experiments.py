@@ -38,6 +38,9 @@ def main():
                     choices=["centralized", "federated", "twin", "conformal", "loho"])
     ap.add_argument("--preset", default="full", choices=["fast", "full"])
     ap.add_argument("--strategies", nargs="+", default=STRATEGIES)
+    ap.add_argument("--hospitals", nargs="+", default=None,
+                    help="loho: restrict which hospitals to hold out (for "
+                         "splitting the 6 hold-outs across GPUs/processes)")
     ap.add_argument("--cache-dir", default="data/cache")
     ap.add_argument("--eval-repo", default="external/evaluation-2021")
     ap.add_argument("--results-dir", default="results")
@@ -189,8 +192,18 @@ def main():
         from fedcardiotwin.train.metrics import (macro_auroc, macro_f1,
                                                  tune_thresholds)
         seed = cfg.seeds[0]
-        loho = {}
-        for held in list(clients):
+        # Per-hospital result files so the 6 hold-outs can be split across
+        # parallel processes/GPUs (via --hospitals) without clobbering one
+        # shared file. Merge loho_<hospital>_seed*.json -> loho_seed*.json
+        # after all processes finish.
+        targets = list(clients)
+        if args.hospitals:
+            targets = [c for c in clients if c.name in set(args.hospitals)]
+        for held in targets:
+            out_path = f"{args.results_dir}/loho_{held.name}_seed{seed}.json"
+            if os.path.exists(out_path):
+                log.info(f"[loho] {held.name} already done, skipping")
+                continue
             train_clients = [c for c in clients if c.name != held.name]
             seed_everything(seed)
             log.info(f"[loho] holding out {held.name}")
@@ -204,10 +217,9 @@ def main():
                 yv_all.append(yv)
             th = tune_thresholds(np.concatenate(yv_all), np.concatenate(pv_all))
             pt, yt = predict(gmodel, held.loader("test", cfg.fl.batch_size), device)
-            loho[held.name] = {"auroc": macro_auroc(yt, pt),
-                               "f1": macro_f1(yt, pt, th)}
-            log.info(f"[loho] {held.name}: {loho[held.name]}")
-        save_json(loho, f"{args.results_dir}/loho_seed{seed}.json")
+            res = {"auroc": macro_auroc(yt, pt), "f1": macro_f1(yt, pt, th)}
+            save_json({held.name: res}, out_path)
+            log.info(f"[loho] {held.name}: {res}")
 
     log.info("stage complete.")
 
