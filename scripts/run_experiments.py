@@ -49,7 +49,7 @@ def main():
     log.info(f"device: {device}")
     os.makedirs(args.ckpt_dir, exist_ok=True)
 
-    if args.stage in ("centralized", "federated", "conformal"):
+    if args.stage in ("centralized", "federated", "conformal", "loho"):
         space = ScoredLabelSpace(args.eval_repo)
         clients = load_clients(args.cache_dir, cfg.clients)
         log.info(f"clients: {[(c.name, len(c)) for c in clients]}")
