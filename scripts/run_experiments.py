@@ -98,10 +98,19 @@ def main():
                     continue
                 seed_everything(seed)
                 progress_path = f"{args.ckpt_dir}/fed_{strategy}_seed{seed}_progress.pt"
-                res, history, comm_mb, gmodel, deployed = run_federated(
-                    clients, space.num_classes, cfg.fl, device,
-                    model_name=cfg.model, strategy=strategy, seed=seed,
-                    ckpt_path=progress_path)
+                try:
+                    res, history, comm_mb, gmodel, deployed = run_federated(
+                        clients, space.num_classes, cfg.fl, device,
+                        model_name=cfg.model, strategy=strategy, seed=seed,
+                        ckpt_path=progress_path)
+                except Exception as e:
+                    # One strategy/seed diverging or erroring must not abort the
+                    # remaining runs in this process. Drop its (possibly poisoned)
+                    # progress so a future invocation restarts it cleanly.
+                    log.error(f"[federated] {strategy} seed{seed} FAILED: {e}")
+                    if os.path.exists(progress_path):
+                        os.remove(progress_path)
+                    continue
                 res["comm_mb_per_round"] = comm_mb
                 res["history"] = history  # convergence / comm-budget curves
                 save_json(res, f"{args.results_dir}/fed_{strategy}_seed{seed}.json")

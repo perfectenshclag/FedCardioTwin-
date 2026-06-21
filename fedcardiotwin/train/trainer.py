@@ -84,6 +84,8 @@ def train_model(model, loader, device, epochs, lr=1e-3, weight_decay=1e-4,
                            for p, g in zip(params, global_params))
                 loss = loss + 0.5 * prox_mu * prox
             scaler.scale(loss).backward()
+            scaler.unscale_(opt)  # clip in real (unscaled) gradient space
+            torch.nn.utils.clip_grad_norm_(params, max_norm=5.0)
             scaler.step(opt)
             scaler.update()
             sched.step()
