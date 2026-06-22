@@ -186,7 +186,8 @@ def main():
             pv, yv = predict(model, c.loader("val", cfg.fl.batch_size), device)
             pt, yt = predict(model, c.loader("test", cfg.fl.batch_size), device)
             cal[c.name], test[c.name] = (pv, yv), (pt, yt)
-        res = run_conformal(cal, test, alpha=cfg.conformal.alpha)
+        res = run_conformal(cal, test, alpha=cfg.conformal.alpha,
+                            cal_alpha=cfg.conformal.cal_alpha)
         save_json(res, f"{args.results_dir}/conformal.json")
         log.info(f"conformal: federated lambda={res['federated_lambda']:.3f}")
 

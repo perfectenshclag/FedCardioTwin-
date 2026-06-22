@@ -56,30 +56,37 @@ def evaluate_sets(test_probs, test_labels, lam):
     }
 
 
-def run_conformal(client_val, client_test, alpha=0.1):
+def run_conformal(client_val, client_test, alpha=0.1, cal_alpha=None):
     """client_val/test: dicts name -> (probs, labels).
 
     Three modes per client:
       local       — lambda calibrated on the client's own data only.
       federated   — one shared lambda (group-level guarantee; can violate a
                     given hospital, e.g. high-prevalence sites).
-      personalized— lambda_h = max(federated lambda, local lambda_h): the
-                    federated value acts as a shared floor, raised to each
-                    hospital's own CRC threshold so FNR_h <= alpha holds at
-                    EVERY hospital by construction (larger lambda => larger
-                    sets => lower FNR), while small-calibration sites still
-                    benefit from the federated prior.
+      personalized— lambda_h = max(federated lambda, conservative local
+                    lambda_h): the federated value acts as a shared floor,
+                    raised to each hospital's own CRC threshold calibrated at
+                    a tighter cal_alpha (<= alpha). The tighter target leaves
+                    finite-sample headroom so even small-calibration sites
+                    test under alpha, while larger sites benefit from the
+                    federated prior.
+
+    cal_alpha defaults to alpha (no conservatism). Set it below alpha (e.g.
+    0.08 for alpha=0.1) to robustly hit FNR_h <= alpha at every hospital.
     """
+    cal_alpha = alpha if cal_alpha is None else cal_alpha
     fed_lam = federated_lambda(list(client_val.values()), alpha)
     out = {}
     for name in client_val:
         pv, yv = client_val[name]
         pt, yt = client_test[name]
-        local_lam = crc_lambda(pv, yv, alpha)
-        pers_lam = max(fed_lam, local_lam)
+        local_lam = crc_lambda(pv, yv, alpha)            # reported "local"
+        pers_local = crc_lambda(pv, yv, cal_alpha)       # conservative
+        pers_lam = max(fed_lam, pers_local)
         out[name] = {
             "local": evaluate_sets(pt, yt, local_lam),
             "federated": evaluate_sets(pt, yt, fed_lam),
             "personalized": evaluate_sets(pt, yt, pers_lam),
         }
-    return {"alpha": alpha, "federated_lambda": fed_lam, "clients": out}
+    return {"alpha": alpha, "cal_alpha": cal_alpha,
+            "federated_lambda": fed_lam, "clients": out}

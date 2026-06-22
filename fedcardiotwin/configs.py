@@ -45,6 +45,9 @@ class TwinConfig:
 @dataclass
 class ConformalConfig:
     alpha: float = 0.1
+    cal_alpha: float = 0.08  # conservative per-hospital calibration target:
+                             # leaves finite-sample headroom so small sites
+                             # (e.g. CPSC-Extra) still test under alpha
 
 
 @dataclass

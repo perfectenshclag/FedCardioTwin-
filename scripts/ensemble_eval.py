@@ -56,7 +56,14 @@ def main():
     if args.fed_clients:
         # Ensemble the per-client deployed models across seeds (e.g. FedPer).
         states = [torch.load(p, map_location="cpu") for p in args.fed_clients]
-        model_name = (args.models or ["inception1d"])[0]
+        # The deployed models are an architecture (inception1d), NOT a strategy
+        # name -- guard against passing e.g. --models fedper by mistake.
+        VALID = {"inception1d", "resnet1d"}
+        model_name = (args.models or [cfg.model])[0]
+        if model_name not in VALID:
+            log.info(f"--models '{model_name}' is not an architecture; "
+                     f"using '{cfg.model}'")
+            model_name = cfg.model
         for c in clients:
             pv_list, pt_list = [], []
             yv = yt = None
